@@ -1,11 +1,17 @@
 import re
+import warnings
 from datetime import datetime
 from io import StringIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.pipeline import Pipeline
 
 st.set_page_config(page_title="WhatsApp Behavioural Profiling", page_icon="🛡️", layout="wide")
 st.title("🛡️ WhatsApp Behavioural Profiling")
@@ -20,10 +26,39 @@ FEATURES = [
 ]
 RF_PATH = "whatsapp_takeover_rf_model.joblib"
 ISO_PATH = "whatsapp_isolation_forest_model.joblib"
+DATA_PATH = "synthetic_labelled_sessions.csv"
+RANDOM_STATE = 42
+
+
+def train_models():
+    """Retrain both models from the bundled synthetic CSV (same settings as the notebook)."""
+    data = pd.read_csv(Path(__file__).parent / DATA_PATH)
+    X, y, groups = data[FEATURES], data["label"].astype(int), data["user_id"]
+    train_idx, _ = next(GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=RANDOM_STATE).split(X, y, groups=groups))
+    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+    rf = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", RandomForestClassifier(n_estimators=200, class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1)),
+    ]).fit(X_train, y_train)
+    iso = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", IsolationForest(n_estimators=200, contamination=0.20, random_state=RANDOM_STATE)),
+    ]).fit(X_train.loc[y_train == 0])
+    return rf, iso
+
 
 @st.cache_resource
 def load_models():
-    return joblib.load(RF_PATH), joblib.load(ISO_PATH)
+    """Load the saved models. If they were built with a different scikit-learn
+    version (or can't be read), retrain from the bundled CSV instead of crashing."""
+    base = Path(__file__).parent
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # treat version-mismatch warnings as failures
+            return joblib.load(base / RF_PATH), joblib.load(base / ISO_PATH), "saved"
+    except Exception:
+        rf, iso = train_models()
+        return rf, iso, "retrained"
 
 def parse_timestamp(value):
     value = value.strip()
@@ -101,11 +136,13 @@ def prepare_csv(df):
     return df
 
 try:
-    rf_model, iso_model = load_models()
+    rf_model, iso_model, model_source = load_models()
 except Exception as exc:
-    st.error("The model files could not be loaded. Put both .joblib files beside app.py in the GitHub repository.")
-    st.code(f"Required files:\n{RF_PATH}\n{ISO_PATH}")
+    st.error("The models could not be loaded or trained. Make sure the .joblib files and synthetic_labelled_sessions.csv are beside app.py in the GitHub repository.")
+    st.code(f"Required files:\n{RF_PATH}\n{ISO_PATH}\n{DATA_PATH}\n\nError: {exc}")
     st.stop()
+if model_source == "retrained":
+    st.caption("Models were retrained on startup from the bundled synthetic dataset (saved models were built with a different scikit-learn version).")
 
 st.info("Use a WhatsApp exported .txt chat, or a prepared .csv containing the five model features. Results are experimental because the models were trained on synthetic data.")
 uploaded = st.file_uploader("Upload WhatsApp export (.txt) or prepared feature CSV (.csv)", type=["txt", "csv"])
