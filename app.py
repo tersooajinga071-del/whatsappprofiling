@@ -61,28 +61,52 @@ def load_models():
         return rf, iso, "retrained"
 
 def parse_timestamp(value):
-    value = value.strip()
+    """Parse common WhatsApp timestamps across Android/iOS export locales."""
+    value = str(value).strip()
+    # Normalize non-breaking/narrow spaces and invisible direction marks found in exports.
+    value = re.sub(r"[\u00a0\u202f\u200e\u200f\u2066-\u2069]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip().strip("[]")
     formats = [
+        # Day/month and month/day, with 2- or 4-digit year; 12/24-hour clocks.
+        "%d/%m/%Y, %I:%M:%S %p", "%d/%m/%y, %I:%M:%S %p",
+        "%m/%d/%Y, %I:%M:%S %p", "%m/%d/%y, %I:%M:%S %p",
         "%d/%m/%Y, %I:%M %p", "%d/%m/%y, %I:%M %p",
-        "%d/%m/%Y, %H:%M", "%d/%m/%y, %H:%M",
         "%m/%d/%Y, %I:%M %p", "%m/%d/%y, %I:%M %p",
+        "%d/%m/%Y, %H:%M:%S", "%d/%m/%y, %H:%M:%S",
+        "%m/%d/%Y, %H:%M:%S", "%m/%d/%y, %H:%M:%S",
+        "%d/%m/%Y, %H:%M", "%d/%m/%y, %H:%M",
         "%m/%d/%Y, %H:%M", "%m/%d/%y, %H:%M",
+        # ISO-like and dot-separated dates seen in some localized exports.
+        "%Y-%m-%d, %H:%M:%S", "%Y-%m-%d, %H:%M",
+        "%Y/%m/%d, %H:%M:%S", "%Y/%m/%d, %H:%M",
+        "%d.%m.%Y, %H:%M:%S", "%d.%m.%Y, %H:%M",
+        "%d.%m.%y, %H:%M:%S", "%d.%m.%y, %H:%M",
     ]
     for fmt in formats:
         try:
             return datetime.strptime(value, fmt)
         except ValueError:
-            pass
+            continue
     return None
 
+
 def parse_whatsapp_txt(raw_text):
-    # Supports common Android/iOS export styles; timestamps are interpreted locally.
+    """Parse common WhatsApp text exports, including bracketed iOS and Android formats.
+
+    A new message begins with a date/time prefix. Continuation lines are appended to
+    the previous message. System notifications without a sender are safely ignored.
+    """
+    # Date/time prefix; allow seconds, varying date separators, AM/PM, and Unicode spaces.
+    date_part = r"(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[/.]\d{1,2}[/.]\d{2,4})"
+    time_part = r"\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?"
     patterns = [
-        re.compile(r"^\[(\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\]\s*([^:]+?):\s?(.*)$"),
-        re.compile(r"^(\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}:\d{2})\s*-\s*([^:]+?):\s?(.*)$"),
+        re.compile(r"^\[\s*(" + date_part + r",\s*" + time_part + r")\s*\]\s*(.*)$"),
+        re.compile(r"^(" + date_part + r",\s*" + time_part + r")\s+-\s+(.*)$"),
     ]
     rows, current = [], None
-    for line in raw_text.splitlines():
+    for original_line in raw_text.lstrip("\ufeff").splitlines():
+        # Strip common invisible direction characters but preserve message contents otherwise.
+        line = re.sub(r"[\u200e\u200f\u2066-\u2069]", "", original_line).strip("\r")
         match = None
         for pattern in patterns:
             match = pattern.match(line)
@@ -92,9 +116,17 @@ def parse_whatsapp_txt(raw_text):
             if current:
                 rows.append(current)
             ts = parse_timestamp(match.group(1))
-            if ts:
-                current = {"timestamp": ts, "sender": match.group(2).strip(), "message": match.group(3).strip()}
+            rest = match.group(2).strip()
+            # Sender labels may contain spaces; split on the first colon followed by a space.
+            sender_match = re.match(r"^(.+?):\s?(.*)$", rest)
+            if ts and sender_match and sender_match.group(1).strip():
+                current = {
+                    "timestamp": ts,
+                    "sender": sender_match.group(1).strip(),
+                    "message": sender_match.group(2).strip(),
+                }
             else:
+                # Ignore WhatsApp system events (e.g. encryption notices) without a sender.
                 current = None
         elif current and line.strip():
             current["message"] += "\n" + line.strip()
@@ -152,7 +184,8 @@ if uploaded:
             raw = uploaded.getvalue().decode("utf-8-sig", errors="replace")
             messages = parse_whatsapp_txt(raw)
             if messages.empty:
-                st.error("No supported timestamped messages were found. Try exporting the chat without media and check the timestamp format.")
+                st.error("The app could not recognize any timestamped sender messages in this .txt file.")
+                st.caption("Supported examples: 12/06/2026, 9:30 PM - Name: Hello | [12/06/26, 9:30:12 AM] Name: Hello | 2026-06-12, 21:30 - Name: Hello. Export as plain text (.txt), not a PDF or copied chat screen.")
                 st.stop()
             features_df = chat_to_features(messages)
             st.write(f"Parsed **{len(messages)} messages** from **{features_df['sender'].nunique()} senders**.")
